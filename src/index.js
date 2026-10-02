@@ -12,23 +12,33 @@
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/callback" && request.method === "GET") {
-      return handleCallback(url, env);
+    try {
+      return await route(request, env);
+    } catch (err) {
+      // Statt Cloudflare-Fehler 1101 eine lesbare Antwort liefern (enthält keine Secrets)
+      console.error("Unhandled worker error:", err?.stack ?? err);
+      return json({ error: "internal_error", message: String(err?.message ?? err) }, 500);
     }
-
-    if (url.pathname === "/refresh" && request.method === "POST") {
-      return handleRefresh(request, env);
-    }
-
-    if (url.pathname === "/") {
-      return new Response("Sonos OAuth relay is running.", { status: 200 });
-    }
-
-    return new Response("Not found", { status: 404 });
   },
 };
+
+async function route(request, env) {
+  const url = new URL(request.url);
+
+  if (url.pathname === "/callback" && request.method === "GET") {
+    return handleCallback(url, env);
+  }
+
+  if (url.pathname === "/refresh" && request.method === "POST") {
+    return handleRefresh(request, env);
+  }
+
+  if (url.pathname === "/") {
+    return new Response("Sonos OAuth relay is running.", { status: 200 });
+  }
+
+  return new Response("Not found", { status: 404 });
+}
 
 async function handleCallback(url, env) {
   const code = url.searchParams.get("code");
