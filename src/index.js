@@ -5,6 +5,9 @@
  * Code serverseitig gegen Access-/Refresh-Token (Client-Secret bleibt hier,
  * nie in der App) und reicht die Tokens per Redirect an die Android-App
  * weiter (Custom-URI-Scheme, z.B. sonoscontrol://callback?access_token=...).
+ *
+ * Zusätzlich erneuert POST /refresh einen abgelaufenen Access-Token mit dem
+ * Refresh-Token der App — auch dafür braucht Sonos das Client-Secret.
  */
 
 export default {
@@ -13,6 +16,10 @@ export default {
 
     if (url.pathname === "/callback" && request.method === "GET") {
       return handleCallback(url, env);
+    }
+
+    if (url.pathname === "/refresh" && request.method === "POST") {
+      return handleRefresh(request, env);
     }
 
     if (url.pathname === "/") {
@@ -72,6 +79,79 @@ async function handleCallback(url, env) {
     refresh_token: tokenData.refresh_token,
     expires_in: tokenData.expires_in != null ? String(tokenData.expires_in) : undefined,
     state,
+  });
+}
+
+/**
+ * POST /refresh  Body: {"refresh_token": "..."}
+ *
+ * Antworten an die App:
+ * - 200 {access_token, refresh_token, expires_in}
+ * - 401 {error: "invalid_grant"}  Refresh-Token ungültig/widerrufen → App muss neu anmelden
+ * - 400 {error: "invalid_request"} Body ohne refresh_token
+ * - 502 {error: "..."}            Sonos nicht erreichbar oder anderer Fehler → später erneut versuchen
+ */
+async function handleRefresh(request, env) {
+  let refreshToken;
+  try {
+    const body = await request.json();
+    refreshToken = body?.refresh_token;
+  } catch (err) {
+    refreshToken = undefined;
+  }
+  if (typeof refreshToken !== "string" || refreshToken.length === 0) {
+    return json({ error: "invalid_request" }, 400);
+  }
+
+  const basicAuth = btoa(`${env.SONOS_CLIENT_ID}:${env.SONOS_CLIENT_SECRET}`);
+
+  let tokenResponse;
+  try {
+    tokenResponse = await fetch("https://api.sonos.com/login/v3/oauth/access", {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${basicAuth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }).toString(),
+    });
+  } catch (err) {
+    return json({ error: "token_request_failed" }, 502);
+  }
+
+  if (!tokenResponse.ok) {
+    const errorBody = await tokenResponse.text();
+    console.error("Sonos token refresh failed:", tokenResponse.status, errorBody);
+    let sonosError;
+    try {
+      sonosError = JSON.parse(errorBody)?.error;
+    } catch (err) {
+      sonosError = undefined;
+    }
+    // Nur ein abgelehnter Refresh-Token bedeutet "neu anmelden". Falsche
+    // Client-Daten o.ä. sind ein Problem des Workers, nicht der App-Anmeldung.
+    if (sonosError === "invalid_grant") {
+      return json({ error: "invalid_grant" }, 401);
+    }
+    return json({ error: "token_refresh_failed" }, 502);
+  }
+
+  const tokenData = await tokenResponse.json();
+  return json({
+    access_token: tokenData.access_token,
+    // Sonos liefert hier den (ggf. neuen) Refresh-Token mit — sonst den alten weiterverwenden
+    refresh_token: tokenData.refresh_token ?? refreshToken,
+    expires_in: tokenData.expires_in,
+  });
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
   });
 }
 

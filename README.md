@@ -27,12 +27,32 @@ Redirect an die Android-App weiterreicht.
    exakt `https://sonos-relay.<dein-subdomain>.workers.dev/callback`
    eintragen.
 
+## Endpunkte
+
+- `GET /callback` — OAuth-Redirect von Sonos, tauscht den Code gegen Tokens
+  und leitet auf `sonoscontrol://callback?access_token=…&refresh_token=…&expires_in=…`
+  weiter.
+- `POST /refresh` — Body `{"refresh_token": "…"}`. Holt bei Sonos einen
+  neuen Access-Token (Access-Tokens laufen nach 24 h ab).
+  - `200 {"access_token", "refresh_token", "expires_in"}`
+  - `401 {"error": "invalid_grant"}` — Refresh-Token ungültig/widerrufen,
+    die App muss sich neu anmelden
+  - `400 {"error": "invalid_request"}` — kein `refresh_token` im Body
+  - `502` — Sonos nicht erreichbar oder anderer Fehler, später erneut versuchen
+
 ## Testen
 
 ```
 curl -i "https://sonos-relay.<dein-subdomain>.workers.dev/"
 ```
 sollte "Sonos OAuth relay is running." liefern.
+
+Refresh testen:
+```
+curl -i -X POST "https://sonos-relay.<dein-subdomain>.workers.dev/refresh" \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token":"<refresh-token>"}'
+```
 
 Den vollständigen Login-Flow testest du am einfachsten direkt aus der
 Android-App heraus (siehe SonosSpeakers-Projekt).
