@@ -1,2 +1,38 @@
-# SonosSoundBuddyRelay
-Relay for the SonosSoundBuddy App After Sonos Authentication
+# sonos-relay
+
+Cloudflare Worker, der den Sonos-OAuth-Callback entgegennimmt, den
+Authorization-Code serverseitig gegen Tokens tauscht und die Tokens per
+Redirect an die Android-App weiterreicht.
+
+## Setup
+
+1. `npm install`
+2. `npx wrangler login`
+3. In `wrangler.toml`:
+   - `SONOS_CLIENT_ID` eintragen (aus dem Sonos Developer Portal)
+   - `REDIRECT_URI` auf die eigene Worker-URL setzen (siehe Schritt 5)
+4. Secret setzen (landet NICHT in wrangler.toml / Git):
+   ```
+   npx wrangler secret put SONOS_CLIENT_SECRET
+   ```
+5. Deployen:
+   ```
+   npx wrangler deploy
+   ```
+   Wrangler gibt dir danach die finale URL aus, z.B.
+   `https://sonos-relay.<dein-subdomain>.workers.dev`
+6. Falls die URL in Schritt 5 von dem abweicht, was du in `REDIRECT_URI`
+   vermutet hast: `wrangler.toml` anpassen und erneut deployen.
+7. Bei Sonos (developer.sonos.com → deine Integration) als Redirect-URI
+   exakt `https://sonos-relay.<dein-subdomain>.workers.dev/callback`
+   eintragen.
+
+## Testen
+
+```
+curl -i "https://sonos-relay.<dein-subdomain>.workers.dev/"
+```
+sollte "Sonos OAuth relay is running." liefern.
+
+Den vollständigen Login-Flow testest du am einfachsten direkt aus der
+Android-App heraus (siehe SonosSpeakers-Projekt).

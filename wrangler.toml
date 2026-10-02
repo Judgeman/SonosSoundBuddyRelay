@@ -1,0 +1,15 @@
+name = "sonos-relay"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Nicht-geheime Konfigurationswerte. SONOS_CLIENT_SECRET NICHT hier eintragen,
+# sondern per "wrangler secret put SONOS_CLIENT_SECRET" setzen.
+[vars]
+SONOS_CLIENT_ID = "REPLACE_WITH_YOUR_SONOS_CLIENT_ID"
+
+# Muss 1:1 der Worker-URL entsprechen, die du bei Sonos als Redirect-URI
+# hinterlegst, z.B. https://sonos-relay.<dein-subdomain>.workers.dev/callback
+REDIRECT_URI = "https://sonos-relay.<your-subdomain>.workers.dev/callback"
+
+# Custom-URI-Scheme, das die Android-App per Intent-Filter abfängt
+APP_CALLBACK_SCHEME = "sonoscontrol://callback"
