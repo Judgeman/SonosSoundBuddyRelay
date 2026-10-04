@@ -8,6 +8,10 @@
  *
  * Zusätzlich erneuert POST /refresh einen abgelaufenen Access-Token mit dem
  * Refresh-Token der App — auch dafür braucht Sonos das Client-Secret.
+ *
+ * Unter /sync/… gleichen mehrere Tablets ihre Einstellungen ab (siehe unten,
+ * „Abgleich zwischen Tablets“). Dafür braucht der Worker einen KV-Speicher
+ * mit dem Binding SYNC_KV.
  */
 
 export default {
@@ -31,6 +35,10 @@ async function route(request, env) {
 
   if (url.pathname === "/refresh" && request.method === "POST") {
     return handleRefresh(request, env);
+  }
+
+  if (url.pathname === "/sync" || url.pathname.startsWith("/sync/")) {
+    return handleSync(request, url, env);
   }
 
   if (url.pathname === "/") {
@@ -156,6 +164,218 @@ async function handleRefresh(request, env) {
     refresh_token: tokenData.refresh_token ?? refreshToken,
     expires_in: tokenData.expires_in,
   });
+}
+
+// --- Abgleich zwischen Tablets -------------------------------------------
+//
+// Ein Tablet (das Haupt-Tablet) lädt seinen Stand hoch, die anderen holen ihn
+// ab. Abgelegt wird alles im KV-Speicher SYNC_KV, getrennt nach Sonos-Haushalt:
+//
+//   hh:<household>:meta        {version, updatedAt, deviceName, images[]}
+//   hh:<household>:snapshot    {version, updatedAt, deviceName, snapshot}
+//   hh:<household>:img:<sha256> Bild (JPEG)
+//
+// Jede Anfrage braucht den Sonos-Access-Token der App (Authorization: Bearer …)
+// und den Haushalt (?household=…). Der Worker fragt Sonos, welche Haushalte zu
+// dem Token gehören — nur auf diese gibt es Zugriff. So können sich verschiedene
+// Sonos-Konten und Haushalte nicht gegenseitig lesen oder überschreiben.
+
+const SONOS_HOUSEHOLDS_URL = "https://api.ws.sonos.com/control/api/v1/households";
+const HOUSEHOLD_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
+const HASH_PATTERN = /^[0-9a-f]{64}$/;
+const MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+// Pro Aufruf erlaubt Cloudflare 1000 KV-Zugriffe; ein Upload braucht bis zu zwei je Bild
+const MAX_IMAGES = 400;
+
+async function handleSync(request, url, env) {
+  const kv = env.SYNC_KV;
+  if (!kv) {
+    return json({ error: "sync_not_configured" }, 501);
+  }
+
+  const household = url.searchParams.get("household") ?? "";
+  if (!HOUSEHOLD_PATTERN.test(household)) {
+    return json({ error: "invalid_household" }, 400);
+  }
+  const denied = await checkHouseholdAccess(request, household);
+  if (denied) return denied;
+
+  const prefix = `hh:${household}:`;
+  const path = url.pathname;
+  const method = request.method;
+
+  if (path === "/sync/state" && method === "GET") {
+    const meta = await kv.get(prefix + "meta", "json");
+    if (!meta) return json({ error: "not_found" }, 404);
+    return json({ version: meta.version, updatedAt: meta.updatedAt, deviceName: meta.deviceName });
+  }
+
+  if (path === "/sync/snapshot" && method === "GET") {
+    const stored = await kv.get(prefix + "snapshot", "text");
+    if (!stored) return json({ error: "not_found" }, 404);
+    return new Response(stored, {
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  }
+
+  if (path === "/sync/snapshot" && method === "PUT") {
+    return putSnapshot(request, kv, prefix);
+  }
+
+  if (path === "/sync/images/missing" && method === "POST") {
+    const body = await readJson(request, MAX_SNAPSHOT_BYTES);
+    const hashes = body?.hashes;
+    if (!Array.isArray(hashes) || hashes.length > MAX_IMAGES || !hashes.every((h) => HASH_PATTERN.test(h))) {
+      return json({ error: "invalid_request" }, 400);
+    }
+    const meta = await kv.get(prefix + "meta", "json");
+    return json({ missing: await findMissingImages(kv, prefix, hashes, meta) });
+  }
+
+  const imageMatch = path.match(/^\/sync\/images\/([0-9a-f]{64})$/);
+  if (imageMatch && method === "PUT") {
+    const hash = imageMatch[1];
+    const bytes = await readBytes(request, MAX_IMAGE_BYTES);
+    if (!bytes) return json({ error: "too_large" }, 413);
+    // Der Name ist der Inhalt: so kann niemand unter fremdem Namen etwas ablegen
+    if ((await sha256Hex(bytes)) !== hash) return json({ error: "hash_mismatch" }, 400);
+    await kv.put(prefix + "img:" + hash, bytes);
+    return json({ ok: true });
+  }
+  if (imageMatch && method === "GET") {
+    const bytes = await kv.get(prefix + "img:" + imageMatch[1], "arrayBuffer");
+    if (!bytes) return json({ error: "not_found" }, 404);
+    return new Response(bytes, {
+      headers: { "Content-Type": "image/jpeg", "Cache-Control": "no-store" },
+    });
+  }
+
+  if (path === "/sync" && method === "DELETE") {
+    const meta = await kv.get(prefix + "meta", "json");
+    const images = Array.isArray(meta?.images) ? meta.images : [];
+    await Promise.all(images.map((hash) => kv.delete(prefix + "img:" + hash)));
+    await kv.delete(prefix + "snapshot");
+    await kv.delete(prefix + "meta");
+    return json({ ok: true });
+  }
+
+  return json({ error: "not_found" }, 404);
+}
+
+/**
+ * PUT /sync/snapshot  Body: {"deviceName": "…", "images": ["<sha256>", …], "snapshot": {…}}
+ *
+ * Alle Bilder müssen vorher hochgeladen sein, sonst 409 mit der Liste der fehlenden.
+ * Bilder, die der neue Stand nicht mehr braucht, werden danach gelöscht.
+ */
+async function putSnapshot(request, kv, prefix) {
+  const body = await readJson(request, MAX_SNAPSHOT_BYTES);
+  const images = body?.images;
+  if (
+    !body ||
+    typeof body.snapshot !== "object" ||
+    body.snapshot === null ||
+    !Array.isArray(images) ||
+    images.length > MAX_IMAGES ||
+    !images.every((h) => HASH_PATTERN.test(h))
+  ) {
+    return json({ error: "invalid_request" }, 400);
+  }
+  const unique = [...new Set(images)];
+  const previous = await kv.get(prefix + "meta", "json");
+  const missing = await findMissingImages(kv, prefix, unique, previous);
+  if (missing.length > 0) return json({ error: "missing_images", missing }, 409);
+
+  const meta = {
+    version: crypto.randomUUID(),
+    updatedAt: Date.now(),
+    deviceName: String(body.deviceName ?? "").slice(0, 100),
+    images: unique,
+  };
+  // Stand zuerst, dann die Meta-Daten: wer die neue Version sieht, bekommt auch den neuen Stand
+  await kv.put(
+    prefix + "snapshot",
+    JSON.stringify({ version: meta.version, updatedAt: meta.updatedAt, deviceName: meta.deviceName, snapshot: body.snapshot })
+  );
+  await kv.put(prefix + "meta", JSON.stringify(meta));
+
+  const stillUsed = new Set(unique);
+  const unused = (Array.isArray(previous?.images) ? previous.images : []).filter((hash) => !stillUsed.has(hash));
+  await Promise.all(unused.map((hash) => kv.delete(prefix + "img:" + hash)));
+
+  return json({ version: meta.version, updatedAt: meta.updatedAt, deviceName: meta.deviceName });
+}
+
+/**
+ * Bilder aus [hashes], die noch nicht im Speicher liegen. Was der zuletzt
+ * hochgeladene Stand schon verwendet, gilt ohne Nachsehen als vorhanden —
+ * das spart KV-Abfragen (pro Aufruf sind nur 1000 erlaubt).
+ */
+async function findMissingImages(kv, prefix, hashes, meta) {
+  const known = new Set(Array.isArray(meta?.images) ? meta.images : []);
+  const unknown = [...new Set(hashes)].filter((hash) => !known.has(hash));
+  const found = await Promise.all(
+    unknown.map(async (hash) => {
+      const stream = await kv.get(prefix + "img:" + hash, "stream");
+      if (stream) await stream.cancel();
+      return stream !== null;
+    })
+  );
+  return unknown.filter((hash, index) => !found[index]);
+}
+
+/**
+ * Prüft bei Sonos, ob der Token der App zum Haushalt gehört.
+ * Gibt eine Fehler-Antwort zurück oder null, wenn alles passt.
+ */
+async function checkHouseholdAccess(request, household) {
+  const auth = request.headers.get("Authorization") ?? "";
+  if (!/^Bearer \S+$/.test(auth)) {
+    return json({ error: "invalid_token" }, 401);
+  }
+  let response;
+  try {
+    response = await fetch(SONOS_HOUSEHOLDS_URL, { headers: { Authorization: auth } });
+  } catch (err) {
+    return json({ error: "sonos_unreachable" }, 502);
+  }
+  // 401/403 von Sonos: Token abgelaufen oder ungültig → App erneuert ihn und versucht es wieder
+  if (response.status === 401 || response.status === 403) {
+    return json({ error: "invalid_token" }, 401);
+  }
+  if (!response.ok) {
+    console.error("Sonos households check failed:", response.status);
+    return json({ error: "sonos_unreachable" }, 502);
+  }
+  const data = await response.json().catch(() => null);
+  const ids = Array.isArray(data?.households) ? data.households.map((h) => h?.id) : [];
+  if (!ids.includes(household)) {
+    return json({ error: "forbidden_household" }, 403);
+  }
+  return null;
+}
+
+async function readBytes(request, limit) {
+  const declared = Number(request.headers.get("Content-Length") ?? "0");
+  if (declared > limit) return null;
+  const buffer = await request.arrayBuffer();
+  return buffer.byteLength > limit ? null : buffer;
+}
+
+async function readJson(request, limit) {
+  const bytes = await readBytes(request, limit);
+  if (!bytes) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch (err) {
+    return null;
+  }
+}
+
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function json(data, status = 200) {

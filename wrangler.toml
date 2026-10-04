@@ -13,3 +13,11 @@ REDIRECT_URI = "https://sonos-relay.<your-subdomain>.workers.dev/callback"
 
 # Custom-URI-Scheme, das die Android-App per Intent-Filter abfängt
 APP_CALLBACK_SCHEME = "sonoscontrol://callback"
+
+# KV-Speicher für den Abgleich zwischen Tablets (/sync/…). Ohne ihn
+# antworten diese Endpunkte mit 501; Login und Refresh laufen trotzdem.
+# Anlegen mit "npx wrangler kv namespace create SYNC_KV" und die ausgegebene
+# id hier eintragen, dann die drei Zeilen einkommentieren (siehe README).
+# [[kv_namespaces]]
+# binding = "SYNC_KV"
+# id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
