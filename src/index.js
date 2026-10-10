@@ -174,13 +174,16 @@ async function handleRefresh(request, env) {
 //   hh:<household>:meta        {version, updatedAt, deviceName, images[]}
 //   hh:<household>:snapshot    {version, updatedAt, deviceName, snapshot}
 //   hh:<household>:img:<sha256> Bild (JPEG)
-//   hh:<household>:played/<tablet> ["<Musik>", …] was dieses Tablet schon gespielt hat
+//   hh:<household>:played/<tablet> [{profileSyncId, musicKey, played, changedAt}, …]
 //
 // Was die Kinder schon gespielt haben, laden alle Tablets hoch, nicht nur das
-// Haupt-Tablet. Jedes Tablet hat dafür einen eigenen Eintrag, abgeholt wird
-// alles zusammen — so überschreiben sich zwei Tablets nie gegenseitig. Der
-// Schrägstrich kommt in keiner Haushalts-Id vor: Beim Auflisten nach
-// „hh:<household>:played/“ kann so kein Eintrag eines anderen Haushalts dabei sein.
+// Haupt-Tablet: je Profil und Musik, ob sie gespielt ist (false = von den Eltern
+// wieder als neu markiert) und wann sich das zuletzt geändert hat. Jedes Tablet
+// hat einen eigenen Eintrag, abgeholt wird alles zusammen, und je Profil und
+// Musik gewinnt die neueste Änderung — so überschreiben sich zwei Tablets nie
+// gegenseitig, und „wieder neu“ kommt bei allen an. Der Schrägstrich kommt in
+// keiner Haushalts-Id vor: Beim Auflisten nach „hh:<household>:played/“ kann so
+// kein Eintrag eines anderen Haushalts dabei sein.
 //
 // Jede Anfrage braucht den Sonos-Access-Token der App (Authorization: Bearer …)
 // und den Haushalt (?household=…). Der Worker fragt Sonos, welche Haushalte zu
@@ -197,8 +200,9 @@ const MAX_IMAGES = 400;
 const PLAYED = "played/";
 const TABLET_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_PLAYED = 20000;
-const MAX_PLAYED_KEY_LENGTH = 1000;
-const MAX_PLAYED_BYTES = 2 * 1024 * 1024;
+const MAX_PROFILE_LENGTH = 100;
+const MAX_MUSIC_LENGTH = 1000;
+const MAX_PLAYED_BYTES = 5 * 1024 * 1024;
 
 async function handleSync(request, url, env) {
   const kv = env.SYNC_KV;
@@ -264,21 +268,23 @@ async function handleSync(request, url, env) {
   }
 
   if (path === "/sync/played" && method === "GET") {
-    return json({ played: await readPlayed(kv, prefix) });
+    return json({ entries: await readPlayed(kv, prefix) });
   }
 
   const playedMatch = path.match(/^\/sync\/played\/([^/]+)$/);
   if (playedMatch && method === "PUT") {
     if (!TABLET_PATTERN.test(playedMatch[1])) return json({ error: "invalid_request" }, 400);
-    const keys = (await readJson(request, MAX_PLAYED_BYTES))?.keys;
-    if (
-      !Array.isArray(keys) ||
-      keys.length > MAX_PLAYED ||
-      !keys.every((key) => typeof key === "string" && key.length > 0 && key.length <= MAX_PLAYED_KEY_LENGTH)
-    ) {
+    const entries = (await readJson(request, MAX_PLAYED_BYTES))?.entries;
+    if (!Array.isArray(entries) || entries.length > MAX_PLAYED || !entries.every(isPlayedEntry)) {
       return json({ error: "invalid_request" }, 400);
     }
-    await kv.put(prefix + PLAYED + playedMatch[1], JSON.stringify([...new Set(keys)]));
+    const stored = entries.map(({ profileSyncId, musicKey, played, changedAt }) => ({
+      profileSyncId,
+      musicKey,
+      played,
+      changedAt,
+    }));
+    await kv.put(prefix + PLAYED + playedMatch[1], JSON.stringify(mergePlayed([stored])));
     return json({ ok: true });
   }
 
@@ -360,14 +366,48 @@ async function findMissingImages(kv, prefix, hashes, meta) {
   return unknown.filter((hash, index) => !found[index]);
 }
 
-/** Was auf irgendeinem Tablet des Haushalts schon gespielt wurde, ohne Doppelte. */
+function isPlayedEntry(entry) {
+  return (
+    typeof entry === "object" &&
+    entry !== null &&
+    typeof entry.profileSyncId === "string" &&
+    entry.profileSyncId.length > 0 &&
+    entry.profileSyncId.length <= MAX_PROFILE_LENGTH &&
+    typeof entry.musicKey === "string" &&
+    entry.musicKey.length > 0 &&
+    entry.musicKey.length <= MAX_MUSIC_LENGTH &&
+    typeof entry.played === "boolean" &&
+    Number.isSafeInteger(entry.changedAt) &&
+    entry.changedAt >= 0
+  );
+}
+
+/** Die Listen aller Tablets des Haushalts, zu einer zusammengeführt. */
 async function readPlayed(kv, prefix) {
   const lists = await Promise.all((await listKeys(kv, prefix + PLAYED)).map((name) => kv.get(name, "json")));
-  const played = new Set();
+  return mergePlayed(lists.filter(Array.isArray));
+}
+
+/**
+ * Je Profil und Musik ein Eintrag: der mit der neuesten Änderung, bei gleichem
+ * Zeitpunkt „gespielt“ — dieselbe Regel wie in der App, damit alle Tablets beim
+ * selben Ergebnis landen.
+ */
+function mergePlayed(lists) {
+  const merged = new Map();
   for (const list of lists) {
-    if (Array.isArray(list)) list.filter((key) => typeof key === "string").forEach((key) => played.add(key));
+    for (const entry of list) {
+      if (!isPlayedEntry(entry)) continue;
+      const key = entry.profileSyncId + "\n" + entry.musicKey;
+      const current = merged.get(key);
+      const wins =
+        !current ||
+        entry.changedAt > current.changedAt ||
+        (entry.changedAt === current.changedAt && entry.played && !current.played);
+      if (wins) merged.set(key, entry);
+    }
   }
-  return [...played].sort();
+  return [...merged.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, entry]) => entry);
 }
 
 /** Namen aller Einträge, die mit [prefix] beginnen — KV liefert sie seitenweise. */

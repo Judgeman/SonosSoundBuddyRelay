@@ -164,59 +164,102 @@ test("nicht mehr gebrauchte Bilder werden gelöscht, Löschen räumt alles weg",
   assert.equal((await call("GET", `/sync/images/${second.hashes[0]}`)).status, 200);
 
   // Auch was die Tablets schon gespielt haben
-  await putPlayed("tablet-1", ["FAVORITE:1:Bibi"]);
-  await putPlayed("tablet-2", ["PLAYLIST:2:Tanzen"]);
-  await putPlayed("tablet-3", ["FAVORITE:3:Radio"]);
+  await putPlayed("tablet-1", [entry("mia", "FAVORITE:1:Bibi", true, 1)]);
+  await putPlayed("tablet-2", [entry("mia", "PLAYLIST:2:Tanzen", true, 1)]);
+  await putPlayed("tablet-3", [entry("paul", "FAVORITE:3:Radio", true, 1)]);
 
   assert.equal((await call("DELETE", "/sync")).status, 200);
   assert.equal(env.SYNC_KV.data.size, 0);
 });
 
-function putPlayed(tablet, keys, options = {}) {
-  return call("PUT", `/sync/played/${tablet}`, { ...options, body: JSON.stringify({ keys }) });
+function entry(profileSyncId, musicKey, played, changedAt) {
+  return { profileSyncId, musicKey, played, changedAt };
+}
+
+function putPlayed(tablet, entries, options = {}) {
+  return call("PUT", `/sync/played/${tablet}`, { ...options, body: JSON.stringify({ entries }) });
 }
 
 async function getPlayed(options = {}) {
   const response = await call("GET", "/sync/played", options);
   assert.equal(response.status, 200);
-  return (await response.json()).played;
+  return (await response.json()).entries;
 }
 
-test("gespielte Musik: jedes Tablet hat seine Liste, abgeholt wird alles zusammen", async () => {
+test("gespielte Musik: jedes Tablet hat seine Liste, abgeholt wird alles zusammen, je Profil", async () => {
   assert.deepEqual(await getPlayed(), []);
 
-  assert.equal((await putPlayed("tablet-1", ["FAVORITE:1:Bibi", "PLAYLIST:2:Tanzen"])).status, 200);
-  assert.equal((await putPlayed("tablet-2", ["PLAYLIST:2:Tanzen", "FAVORITE:3:Radio"])).status, 200);
+  const bibiMia = entry("mia", "FAVORITE:1:Bibi", true, 100);
+  const bibiPaul = entry("paul", "FAVORITE:1:Bibi", true, 200);
+  const tanzenMia = entry("mia", "PLAYLIST:2:Tanzen", true, 300);
+  assert.equal((await putPlayed("tablet-1", [bibiMia, tanzenMia])).status, 200);
+  assert.equal((await putPlayed("tablet-2", [bibiPaul])).status, 200);
   // Mehr Tablets als eine Seite der Liste
-  assert.equal((await putPlayed("tablet-3", ["FAVORITE:4:Schlaflied"])).status, 200);
-  assert.deepEqual(await getPlayed(), ["FAVORITE:1:Bibi", "FAVORITE:3:Radio", "FAVORITE:4:Schlaflied", "PLAYLIST:2:Tanzen"]);
+  const radioPaul = entry("paul", "FAVORITE:3:Radio", true, 400);
+  assert.equal((await putPlayed("tablet-3", [radioPaul])).status, 200);
+  assert.deepEqual(await getPlayed(), [bibiMia, tanzenMia, bibiPaul, radioPaul]);
 
   // Ein Tablet ersetzt nur seine eigene Liste
-  await putPlayed("tablet-1", ["FAVORITE:1:Bibi"]);
-  assert.deepEqual(await getPlayed(), ["FAVORITE:1:Bibi", "FAVORITE:3:Radio", "FAVORITE:4:Schlaflied", "PLAYLIST:2:Tanzen"]);
-  await putPlayed("tablet-2", []);
-  assert.deepEqual(await getPlayed(), ["FAVORITE:1:Bibi", "FAVORITE:4:Schlaflied"]);
+  await putPlayed("tablet-3", []);
+  assert.deepEqual(await getPlayed(), [bibiMia, tanzenMia, bibiPaul]);
+});
+
+test("gespielte Musik: die neueste Änderung gewinnt, auch „wieder neu“", async () => {
+  await putPlayed("tablet-1", [entry("mia", "FAVORITE:1:Bibi", true, 100)]);
+  // Auf Tablet 2 markieren die Eltern Bibi später wieder als neu
+  await putPlayed("tablet-2", [entry("mia", "FAVORITE:1:Bibi", false, 200)]);
+  assert.deepEqual(await getPlayed(), [entry("mia", "FAVORITE:1:Bibi", false, 200)]);
+
+  // Danach hört Mia es auf Tablet 1 wieder
+  await putPlayed("tablet-1", [entry("mia", "FAVORITE:1:Bibi", true, 300)]);
+  assert.deepEqual(await getPlayed(), [entry("mia", "FAVORITE:1:Bibi", true, 300)]);
+
+  // Gleich alt: gespielt gewinnt — die App rechnet genauso
+  await putPlayed("tablet-1", [entry("paul", "FAVORITE:3:Radio", false, 50)]);
+  await putPlayed("tablet-2", [entry("paul", "FAVORITE:3:Radio", true, 50)]);
+  assert.deepEqual((await getPlayed()).find((e) => e.profileSyncId === "paul"), entry("paul", "FAVORITE:3:Radio", true, 50));
+});
+
+test("gespielte Musik: doppelte Einträge eines Tablets werden zusammengefasst, Fremdes nicht gespeichert", async () => {
+  await putPlayed("tablet-1", [
+    { ...entry("mia", "FAVORITE:1:Bibi", true, 100), extra: "weg damit" },
+    entry("mia", "FAVORITE:1:Bibi", false, 50),
+  ]);
+  assert.deepEqual(JSON.parse(env.SYNC_KV.data.get("hh:Sonos_A:played/tablet-1")), [entry("mia", "FAVORITE:1:Bibi", true, 100)]);
 });
 
 test("gespielte Musik bleibt je Haushalt getrennt", async () => {
-  await putPlayed("tablet-1", ["FAVORITE:1:A"], { token: "token-a", household: "Sonos_A" });
-  await putPlayed("tablet-1", ["FAVORITE:1:B"], { token: "token-b", household: "Sonos_B" });
-  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_A" }), ["FAVORITE:1:A"]);
-  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_B" }), ["FAVORITE:1:B"]);
-  assert.equal((await putPlayed("tablet-1", ["x"], { token: "token-a", household: "Sonos_B" })).status, 403);
+  await putPlayed("tablet-1", [entry("mia", "FAVORITE:1:A", true, 1)], { token: "token-a", household: "Sonos_A" });
+  await putPlayed("tablet-1", [entry("mia", "FAVORITE:1:B", true, 1)], { token: "token-b", household: "Sonos_B" });
+  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_A" }), [entry("mia", "FAVORITE:1:A", true, 1)]);
+  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_B" }), [entry("mia", "FAVORITE:1:B", true, 1)]);
+  const foreign = await putPlayed("tablet-1", [entry("mia", "x", true, 1)], { token: "token-a", household: "Sonos_B" });
+  assert.equal(foreign.status, 403);
 
   // Löschen betrifft nur den eigenen Haushalt
   await call("DELETE", "/sync", { token: "token-a", household: "Sonos_A" });
   assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_A" }), []);
-  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_B" }), ["FAVORITE:1:B"]);
+  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_B" }), [entry("mia", "FAVORITE:1:B", true, 1)]);
 });
 
 test("ungültige Liste gespielter Musik wird abgelehnt", async () => {
-  assert.equal((await putPlayed("tablet:1", ["x"])).status, 400);
-  assert.equal((await putPlayed("t".repeat(65), ["x"])).status, 400);
-  assert.equal((await putPlayed("tablet-1", [""])).status, 400);
-  assert.equal((await putPlayed("tablet-1", [42])).status, 400);
-  assert.equal((await putPlayed("tablet-1", ["x".repeat(1001)])).status, 400);
+  const ok = entry("mia", "FAVORITE:1:Bibi", true, 1);
+  assert.equal((await putPlayed("tablet:1", [ok])).status, 400);
+  assert.equal((await putPlayed("t".repeat(65), [ok])).status, 400);
+  for (const bad of [
+    { ...ok, profileSyncId: "" },
+    { ...ok, profileSyncId: "p".repeat(101) },
+    { ...ok, musicKey: "" },
+    { ...ok, musicKey: "x".repeat(1001) },
+    { ...ok, played: "ja" },
+    { ...ok, changedAt: -1 },
+    { ...ok, changedAt: 1.5 },
+    { ...ok, changedAt: "1" },
+    "FAVORITE:1:Bibi",
+    null,
+  ]) {
+    assert.equal((await putPlayed("tablet-1", [ok, bad])).status, 400, JSON.stringify(bad));
+  }
   assert.equal((await call("PUT", "/sync/played/tablet-1", { body: JSON.stringify({}) })).status, 400);
   assert.equal((await call("PUT", "/sync/played/tablet-1", { body: "kein json" })).status, 400);
   assert.deepEqual(await getPlayed(), []);

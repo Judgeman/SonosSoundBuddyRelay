@@ -13,8 +13,8 @@ Token-Anfragen bei Sonos:
 - **Abgleich zwischen Tablets** (optional): speichert den Stand eines
   Haupt-Tablets (Kinder-Profile, Musikauswahl, Bilder, Speaker-Einstellungen,
   Passwort-Hash), damit andere Tablets ihn automatisch übernehmen können.
-  Außerdem gleichen alle Tablets ab, welche Musik die Kinder schon gespielt
-  haben — die App markiert noch nie gespielte Musik als neu.
+  Außerdem gleichen alle Tablets ab, welche Musik welches Kind schon
+  gespielt hat — die App markiert noch nie gespielte Musik als neu.
 
 > **Wo die Daten liegen:** Für den Abgleich speichert der Worker die
 > Einstellungen der App im KV-Speicher des Cloudflare-Accounts, in dem er
@@ -71,15 +71,24 @@ gehören, und erlaubt nur diese. Alle Daten liegen unter dem Haushalt
 | `PUT /sync/images/<sha256>` | Bild hochladen (max. 5 MB); der Name muss der SHA-256 des Inhalts sein |
 | `GET /sync/images/<sha256>` | Bild abholen |
 | `PUT /sync/snapshot` | Body `{"deviceName", "images": [...], "snapshot": {...}}`; alle Bilder müssen vorher hochgeladen sein (sonst `409 missing_images`). Nicht mehr gebrauchte Bilder werden gelöscht. |
-| `GET /sync/played` | `{"played": [...]}`: was auf irgendeinem Tablet des Haushalts schon gespielt wurde (leer, wenn noch nichts) |
-| `PUT /sync/played/<tablet>` | Body `{"keys": [...]}`; ersetzt die Liste dieses Tablets (Kennung aus `A–Z a–z 0–9 _ -`, höchstens 64 Zeichen; höchstens 20 000 Einträge) |
+| `GET /sync/played` | `{"entries": [...]}`: die Listen aller Tablets des Haushalts zusammengeführt (leer, wenn noch nichts) |
+| `PUT /sync/played/<tablet>` | Body `{"entries": [...]}`; ersetzt die Liste dieses Tablets (Kennung aus `A–Z a–z 0–9 _ -`, höchstens 64 Zeichen; höchstens 20 000 Einträge, 5 MB) |
 | `DELETE /sync` | Löscht Stand, Bilder und gespielte Musik des Haushalts |
 
 Den Stand lädt nur das Haupt-Tablet hoch, die gespielte Musik dagegen jedes
-Tablet. Damit sich zwei Tablets dabei nicht gegenseitig überschreiben, hat
-jedes seinen eigenen Eintrag (`hh:<household>:played/<tablet>`); `GET`
-liefert alle zusammen. Ein Eintrag ist ein Text aus Quelle, Sonos-Id und
-Name der Musik, z. B. `FAVORITE:12:Bibi Blocksberg`.
+Tablet. Ein Eintrag sagt, ob ein Kind-Profil eine Musik schon gespielt hat:
+
+```json
+{"profileSyncId": "3f2c…", "musicKey": "FAVORITE:12:Bibi Blocksberg", "played": true, "changedAt": 1760100000000}
+```
+
+`played: false` heißt: von den Eltern wieder als neu markiert. `changedAt`
+ist der Zeitpunkt der Änderung in Millisekunden. Damit sich zwei Tablets
+nicht gegenseitig überschreiben, hat jedes seinen eigenen Eintrag
+(`hh:<household>:played/<tablet>`). `GET` führt alle zusammen: Je Profil und
+Musik gewinnt die neueste Änderung, bei gleichem Zeitpunkt „gespielt“ —
+dieselbe Regel wie in der App. So kommt auch „wieder neu“ bei allen Tablets
+an.
 
 Fehler: `401 invalid_token` (Token fehlt oder Sonos lehnt ihn ab → App
 erneuert ihn), `403 forbidden_household` (Token gehört nicht zu dem
