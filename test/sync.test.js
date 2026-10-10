@@ -31,6 +31,17 @@ class MemoryKV {
   async delete(key) {
     this.data.delete(key);
   }
+  // Wie Cloudflare seitenweise — hier absichtlich kleine Seiten, damit das Weiterblättern getestet ist
+  async list({ prefix = "", cursor } = {}) {
+    const names = [...this.data.keys()].filter((key) => key.startsWith(prefix)).sort();
+    const start = cursor ? Number(cursor) : 0;
+    const end = start + 2;
+    return {
+      keys: names.slice(start, end).map((name) => ({ name })),
+      list_complete: end >= names.length,
+      cursor: end >= names.length ? undefined : String(end),
+    };
+  }
 }
 
 let env;
@@ -152,8 +163,63 @@ test("nicht mehr gebrauchte Bilder werden gelöscht, Löschen räumt alles weg",
   assert.equal((await call("GET", `/sync/images/${first.hashes[0]}`)).status, 404);
   assert.equal((await call("GET", `/sync/images/${second.hashes[0]}`)).status, 200);
 
+  // Auch was die Tablets schon gespielt haben
+  await putPlayed("tablet-1", ["FAVORITE:1:Bibi"]);
+  await putPlayed("tablet-2", ["PLAYLIST:2:Tanzen"]);
+  await putPlayed("tablet-3", ["FAVORITE:3:Radio"]);
+
   assert.equal((await call("DELETE", "/sync")).status, 200);
   assert.equal(env.SYNC_KV.data.size, 0);
+});
+
+function putPlayed(tablet, keys, options = {}) {
+  return call("PUT", `/sync/played/${tablet}`, { ...options, body: JSON.stringify({ keys }) });
+}
+
+async function getPlayed(options = {}) {
+  const response = await call("GET", "/sync/played", options);
+  assert.equal(response.status, 200);
+  return (await response.json()).played;
+}
+
+test("gespielte Musik: jedes Tablet hat seine Liste, abgeholt wird alles zusammen", async () => {
+  assert.deepEqual(await getPlayed(), []);
+
+  assert.equal((await putPlayed("tablet-1", ["FAVORITE:1:Bibi", "PLAYLIST:2:Tanzen"])).status, 200);
+  assert.equal((await putPlayed("tablet-2", ["PLAYLIST:2:Tanzen", "FAVORITE:3:Radio"])).status, 200);
+  // Mehr Tablets als eine Seite der Liste
+  assert.equal((await putPlayed("tablet-3", ["FAVORITE:4:Schlaflied"])).status, 200);
+  assert.deepEqual(await getPlayed(), ["FAVORITE:1:Bibi", "FAVORITE:3:Radio", "FAVORITE:4:Schlaflied", "PLAYLIST:2:Tanzen"]);
+
+  // Ein Tablet ersetzt nur seine eigene Liste
+  await putPlayed("tablet-1", ["FAVORITE:1:Bibi"]);
+  assert.deepEqual(await getPlayed(), ["FAVORITE:1:Bibi", "FAVORITE:3:Radio", "FAVORITE:4:Schlaflied", "PLAYLIST:2:Tanzen"]);
+  await putPlayed("tablet-2", []);
+  assert.deepEqual(await getPlayed(), ["FAVORITE:1:Bibi", "FAVORITE:4:Schlaflied"]);
+});
+
+test("gespielte Musik bleibt je Haushalt getrennt", async () => {
+  await putPlayed("tablet-1", ["FAVORITE:1:A"], { token: "token-a", household: "Sonos_A" });
+  await putPlayed("tablet-1", ["FAVORITE:1:B"], { token: "token-b", household: "Sonos_B" });
+  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_A" }), ["FAVORITE:1:A"]);
+  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_B" }), ["FAVORITE:1:B"]);
+  assert.equal((await putPlayed("tablet-1", ["x"], { token: "token-a", household: "Sonos_B" })).status, 403);
+
+  // Löschen betrifft nur den eigenen Haushalt
+  await call("DELETE", "/sync", { token: "token-a", household: "Sonos_A" });
+  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_A" }), []);
+  assert.deepEqual(await getPlayed({ token: "token-ab", household: "Sonos_B" }), ["FAVORITE:1:B"]);
+});
+
+test("ungültige Liste gespielter Musik wird abgelehnt", async () => {
+  assert.equal((await putPlayed("tablet:1", ["x"])).status, 400);
+  assert.equal((await putPlayed("t".repeat(65), ["x"])).status, 400);
+  assert.equal((await putPlayed("tablet-1", [""])).status, 400);
+  assert.equal((await putPlayed("tablet-1", [42])).status, 400);
+  assert.equal((await putPlayed("tablet-1", ["x".repeat(1001)])).status, 400);
+  assert.equal((await call("PUT", "/sync/played/tablet-1", { body: JSON.stringify({}) })).status, 400);
+  assert.equal((await call("PUT", "/sync/played/tablet-1", { body: "kein json" })).status, 400);
+  assert.deepEqual(await getPlayed(), []);
 });
 
 test("Login-Endpunkte bleiben erreichbar", async () => {

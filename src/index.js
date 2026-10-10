@@ -174,6 +174,13 @@ async function handleRefresh(request, env) {
 //   hh:<household>:meta        {version, updatedAt, deviceName, images[]}
 //   hh:<household>:snapshot    {version, updatedAt, deviceName, snapshot}
 //   hh:<household>:img:<sha256> Bild (JPEG)
+//   hh:<household>:played/<tablet> ["<Musik>", …] was dieses Tablet schon gespielt hat
+//
+// Was die Kinder schon gespielt haben, laden alle Tablets hoch, nicht nur das
+// Haupt-Tablet. Jedes Tablet hat dafür einen eigenen Eintrag, abgeholt wird
+// alles zusammen — so überschreiben sich zwei Tablets nie gegenseitig. Der
+// Schrägstrich kommt in keiner Haushalts-Id vor: Beim Auflisten nach
+// „hh:<household>:played/“ kann so kein Eintrag eines anderen Haushalts dabei sein.
 //
 // Jede Anfrage braucht den Sonos-Access-Token der App (Authorization: Bearer …)
 // und den Haushalt (?household=…). Der Worker fragt Sonos, welche Haushalte zu
@@ -187,6 +194,11 @@ const MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 // Pro Aufruf erlaubt Cloudflare 1000 KV-Zugriffe; ein Upload braucht bis zu zwei je Bild
 const MAX_IMAGES = 400;
+const PLAYED = "played/";
+const TABLET_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_PLAYED = 20000;
+const MAX_PLAYED_KEY_LENGTH = 1000;
+const MAX_PLAYED_BYTES = 2 * 1024 * 1024;
 
 async function handleSync(request, url, env) {
   const kv = env.SYNC_KV;
@@ -251,10 +263,33 @@ async function handleSync(request, url, env) {
     });
   }
 
+  if (path === "/sync/played" && method === "GET") {
+    return json({ played: await readPlayed(kv, prefix) });
+  }
+
+  const playedMatch = path.match(/^\/sync\/played\/([^/]+)$/);
+  if (playedMatch && method === "PUT") {
+    if (!TABLET_PATTERN.test(playedMatch[1])) return json({ error: "invalid_request" }, 400);
+    const keys = (await readJson(request, MAX_PLAYED_BYTES))?.keys;
+    if (
+      !Array.isArray(keys) ||
+      keys.length > MAX_PLAYED ||
+      !keys.every((key) => typeof key === "string" && key.length > 0 && key.length <= MAX_PLAYED_KEY_LENGTH)
+    ) {
+      return json({ error: "invalid_request" }, 400);
+    }
+    await kv.put(prefix + PLAYED + playedMatch[1], JSON.stringify([...new Set(keys)]));
+    return json({ ok: true });
+  }
+
   if (path === "/sync" && method === "DELETE") {
     const meta = await kv.get(prefix + "meta", "json");
     const images = Array.isArray(meta?.images) ? meta.images : [];
-    await Promise.all(images.map((hash) => kv.delete(prefix + "img:" + hash)));
+    const played = await listKeys(kv, prefix + PLAYED);
+    await Promise.all([
+      ...images.map((hash) => kv.delete(prefix + "img:" + hash)),
+      ...played.map((name) => kv.delete(name)),
+    ]);
     await kv.delete(prefix + "snapshot");
     await kv.delete(prefix + "meta");
     return json({ ok: true });
@@ -323,6 +358,28 @@ async function findMissingImages(kv, prefix, hashes, meta) {
     })
   );
   return unknown.filter((hash, index) => !found[index]);
+}
+
+/** Was auf irgendeinem Tablet des Haushalts schon gespielt wurde, ohne Doppelte. */
+async function readPlayed(kv, prefix) {
+  const lists = await Promise.all((await listKeys(kv, prefix + PLAYED)).map((name) => kv.get(name, "json")));
+  const played = new Set();
+  for (const list of lists) {
+    if (Array.isArray(list)) list.filter((key) => typeof key === "string").forEach((key) => played.add(key));
+  }
+  return [...played].sort();
+}
+
+/** Namen aller Einträge, die mit [prefix] beginnen — KV liefert sie seitenweise. */
+async function listKeys(kv, prefix) {
+  const names = [];
+  let cursor;
+  do {
+    const page = await kv.list({ prefix, cursor });
+    names.push(...page.keys.map((key) => key.name));
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return names;
 }
 
 /**
