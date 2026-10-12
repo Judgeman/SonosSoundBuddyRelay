@@ -174,6 +174,16 @@ async function handleRefresh(request, env) {
 //   hh:<household>:meta        {version, updatedAt, deviceName, images[]}
 //   hh:<household>:snapshot    {version, updatedAt, deviceName, snapshot}
 //   hh:<household>:img:<sha256> Bild (JPEG)
+//   hh:<household>:played/<tablet> [{profileSyncId, musicKey, played, changedAt}, …]
+//
+// Was die Kinder schon gespielt haben, laden alle Tablets hoch, nicht nur das
+// Haupt-Tablet: je Profil und Musik, ob sie gespielt ist (false = von den Eltern
+// wieder als neu markiert) und wann sich das zuletzt geändert hat. Jedes Tablet
+// hat einen eigenen Eintrag, abgeholt wird alles zusammen, und je Profil und
+// Musik gewinnt die neueste Änderung — so überschreiben sich zwei Tablets nie
+// gegenseitig, und „wieder neu“ kommt bei allen an. Der Schrägstrich kommt in
+// keiner Haushalts-Id vor: Beim Auflisten nach „hh:<household>:played/“ kann so
+// kein Eintrag eines anderen Haushalts dabei sein.
 //
 // Jede Anfrage braucht den Sonos-Access-Token der App (Authorization: Bearer …)
 // und den Haushalt (?household=…). Der Worker fragt Sonos, welche Haushalte zu
@@ -187,6 +197,12 @@ const MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 // Pro Aufruf erlaubt Cloudflare 1000 KV-Zugriffe; ein Upload braucht bis zu zwei je Bild
 const MAX_IMAGES = 400;
+const PLAYED = "played/";
+const TABLET_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_PLAYED = 20000;
+const MAX_PROFILE_LENGTH = 100;
+const MAX_MUSIC_LENGTH = 1000;
+const MAX_PLAYED_BYTES = 5 * 1024 * 1024;
 
 async function handleSync(request, url, env) {
   const kv = env.SYNC_KV;
@@ -251,10 +267,35 @@ async function handleSync(request, url, env) {
     });
   }
 
+  if (path === "/sync/played" && method === "GET") {
+    return json({ entries: await readPlayed(kv, prefix) });
+  }
+
+  const playedMatch = path.match(/^\/sync\/played\/([^/]+)$/);
+  if (playedMatch && method === "PUT") {
+    if (!TABLET_PATTERN.test(playedMatch[1])) return json({ error: "invalid_request" }, 400);
+    const entries = (await readJson(request, MAX_PLAYED_BYTES))?.entries;
+    if (!Array.isArray(entries) || entries.length > MAX_PLAYED || !entries.every(isPlayedEntry)) {
+      return json({ error: "invalid_request" }, 400);
+    }
+    const stored = entries.map(({ profileSyncId, musicKey, played, changedAt }) => ({
+      profileSyncId,
+      musicKey,
+      played,
+      changedAt,
+    }));
+    await kv.put(prefix + PLAYED + playedMatch[1], JSON.stringify(mergePlayed([stored])));
+    return json({ ok: true });
+  }
+
   if (path === "/sync" && method === "DELETE") {
     const meta = await kv.get(prefix + "meta", "json");
     const images = Array.isArray(meta?.images) ? meta.images : [];
-    await Promise.all(images.map((hash) => kv.delete(prefix + "img:" + hash)));
+    const played = await listKeys(kv, prefix + PLAYED);
+    await Promise.all([
+      ...images.map((hash) => kv.delete(prefix + "img:" + hash)),
+      ...played.map((name) => kv.delete(name)),
+    ]);
     await kv.delete(prefix + "snapshot");
     await kv.delete(prefix + "meta");
     return json({ ok: true });
@@ -323,6 +364,62 @@ async function findMissingImages(kv, prefix, hashes, meta) {
     })
   );
   return unknown.filter((hash, index) => !found[index]);
+}
+
+function isPlayedEntry(entry) {
+  return (
+    typeof entry === "object" &&
+    entry !== null &&
+    typeof entry.profileSyncId === "string" &&
+    entry.profileSyncId.length > 0 &&
+    entry.profileSyncId.length <= MAX_PROFILE_LENGTH &&
+    typeof entry.musicKey === "string" &&
+    entry.musicKey.length > 0 &&
+    entry.musicKey.length <= MAX_MUSIC_LENGTH &&
+    typeof entry.played === "boolean" &&
+    Number.isSafeInteger(entry.changedAt) &&
+    entry.changedAt >= 0
+  );
+}
+
+/** Die Listen aller Tablets des Haushalts, zu einer zusammengeführt. */
+async function readPlayed(kv, prefix) {
+  const lists = await Promise.all((await listKeys(kv, prefix + PLAYED)).map((name) => kv.get(name, "json")));
+  return mergePlayed(lists.filter(Array.isArray));
+}
+
+/**
+ * Je Profil und Musik ein Eintrag: der mit der neuesten Änderung, bei gleichem
+ * Zeitpunkt „gespielt“ — dieselbe Regel wie in der App, damit alle Tablets beim
+ * selben Ergebnis landen.
+ */
+function mergePlayed(lists) {
+  const merged = new Map();
+  for (const list of lists) {
+    for (const entry of list) {
+      if (!isPlayedEntry(entry)) continue;
+      const key = entry.profileSyncId + "\n" + entry.musicKey;
+      const current = merged.get(key);
+      const wins =
+        !current ||
+        entry.changedAt > current.changedAt ||
+        (entry.changedAt === current.changedAt && entry.played && !current.played);
+      if (wins) merged.set(key, entry);
+    }
+  }
+  return [...merged.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, entry]) => entry);
+}
+
+/** Namen aller Einträge, die mit [prefix] beginnen — KV liefert sie seitenweise. */
+async function listKeys(kv, prefix) {
+  const names = [];
+  let cursor;
+  do {
+    const page = await kv.list({ prefix, cursor });
+    names.push(...page.keys.map((key) => key.name));
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return names;
 }
 
 /**
